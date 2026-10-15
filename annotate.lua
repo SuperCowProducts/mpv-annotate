@@ -18,8 +18,10 @@
 -- A value may hold several keys separated by spaces; an empty value unbinds the
 -- command. Defaults:
 --   key_red=d key_orange=o key_yellow=y key_green=e key_blue=b key_purple=p
---   key_pink=k key_gray=a      arm a box of that color, then drag to draw it
---   key_draw=MBTN_LEFT         mouse button used to drag a box
+--   key_pink=k key_gray=a      start a box of that color at the mouse pointer; the
+--                              box then follows the pointer until you confirm it
+--   key_draw=MBTN_LEFT         mouse button that confirms (places) the box
+--   key_confirm="ENTER KP_ENTER"  extra key(s) that confirm the box
 --   key_cancel=ESC             cancel drawing
 --   key_label=l                edit the label of the current box
 --   key_toggle_labels=L        show / hide all labels
@@ -53,7 +55,7 @@ local opts = {
     -- keys (see header)
     key_red = "d", key_orange = "o", key_yellow = "y", key_green = "e",
     key_blue = "b", key_purple = "p", key_pink = "k", key_gray = "a",
-    key_draw = "MBTN_LEFT", key_cancel = "ESC",
+    key_draw = "MBTN_LEFT", key_confirm = "ENTER KP_ENTER", key_cancel = "ESC",
     key_label = "l", key_toggle_labels = "L",
     key_label_bigger = "Ctrl++ Ctrl+=", key_label_smaller = "Ctrl+-",
     key_search = "Ctrl+f", key_next = "Ctrl+n", key_prev = "Ctrl+p",
@@ -559,8 +561,9 @@ local function finish_drag()
     local y1 = clamp(math.max(d.y0, d.y1), vr.y, vr.y + vr.vh)
     if x1 - x0 < 4 or y1 - y0 < 4 then
         log("finish_drag: too small (%.0fx%.0f px), ignored", x1 - x0, y1 - y0)
+        drag = d -- keep resizing from the same corner
         render()
-        return -- a click, not a box; stay armed
+        return
     end
 
     local box = {
@@ -582,23 +585,46 @@ local function finish_drag()
     prompt_label(box, true)
 end
 
-local function on_mouse(e)
+local bound = {}   -- names of the temporary key bindings that exist while armed
+
+local function add_forced(keys, name, fn, flags)
+    local clean = tostring(keys or ""):gsub('["\']', "")
+    local i = 0
+    for k in clean:gmatch("%S+") do
+        i = i + 1
+        local nm = i == 1 and name or (name .. "-" .. i)
+        local ok, err = pcall(mp.add_forced_key_binding, k, nm, fn, flags)
+        if ok then
+            bound[#bound + 1] = nm
+            if k:find("^MBTN_") then -- swallow double clicks (fullscreen toggle)
+                local dn = nm .. "-dbl"
+                if pcall(mp.add_forced_key_binding, k .. "_DBL", dn, function() end) then
+                    bound[#bound + 1] = dn
+                end
+            end
+        else
+            log("bind FAILED for %s (key %q): %s", nm, k, tostring(err))
+        end
+    end
+end
+
+-- place the box at the current pointer position
+local function confirm_box()
     if not armed then return end
     local x, y = mp.get_mouse_pos()
-    if e.event == "down" then
-        drag = { x0 = x, y0 = y, x1 = x, y1 = y }
-        render()
-    elseif e.event == "up" and drag then
-        drag.x1, drag.y1 = x, y
-        finish_drag()
-    end
+    if not drag then drag = { x0 = x, y0 = y } end
+    drag.x1, drag.y1 = x, y
+    finish_drag()
+end
+
+local function on_mouse(e)
+    if armed and e.event == "down" then confirm_box() end
 end
 
 disarm = function()
     armed, drag = nil, nil
-    mp.remove_key_binding("annotate-draw")
-    mp.remove_key_binding("annotate-draw-dbl")
-    mp.remove_key_binding("annotate-cancel")
+    for _, nm in ipairs(bound) do mp.remove_key_binding(nm) end
+    bound = {}
     render()
 end
 
@@ -619,16 +645,19 @@ local function arm(color)
     mp.set_property_native("pause", true)
     if mode == "off" then mode = "all" end
     if not was_armed then
-        mp.add_forced_key_binding(opts.key_draw, "annotate-draw", on_mouse, { complex = true })
-        if opts.key_draw:find("^MBTN_") then -- swallow double clicks (fullscreen toggle)
-            mp.add_forced_key_binding(opts.key_draw .. "_DBL", "annotate-draw-dbl", function() end)
-        end
-        mp.add_forced_key_binding(opts.key_cancel, "annotate-cancel", function()
+        -- the box starts right here, at the pointer, and follows it from now on
+        local x, y = mp.get_mouse_pos()
+        drag = { x0 = x, y0 = y, x1 = x, y1 = y }
+        add_forced(opts.key_draw, "annotate-draw", on_mouse, { complex = true })
+        add_forced(opts.key_confirm, "annotate-confirm", confirm_box)
+        add_forced(opts.key_cancel, "annotate-cancel", function()
             disarm()
             msg("Drawing cancelled")
         end)
     end
-    msg("Drag to draw a " .. color.name .. " box (" .. opts.key_cancel .. " cancels)")
+    local confirm = (opts.key_draw .. " " .. opts.key_confirm):gsub('["\']', ""):gsub("%s+", " / ")
+    msg("Move the mouse to size the " .. color.name .. " box, " .. confirm
+        .. " places it (" .. opts.key_cancel .. " cancels)")
     render()
 end
 
